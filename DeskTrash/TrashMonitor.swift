@@ -1,5 +1,6 @@
 import Foundation
 
+@MainActor
 final class TrashMonitor {
     private let finderTrashService: FinderTrashService
     private let interval: TimeInterval
@@ -13,7 +14,7 @@ final class TrashMonitor {
 
     init(
         finderTrashService: FinderTrashService,
-        interval: TimeInterval = 5.0,
+        interval: TimeInterval = 6.0,
         onCountUpdate: @escaping @MainActor (Int) -> Void
     ) {
         self.finderTrashService = finderTrashService
@@ -22,21 +23,20 @@ final class TrashMonitor {
     }
 
     deinit {
-        stop()
+        monitoringTask?.cancel()
     }
 
     func start() {
         guard monitoringTask == nil else { return }
 
-        monitoringTask = Task { [weak self] in
-            guard let self = self else { return }
-
-            await self.refresh()
+        let interval = interval
+        monitoringTask = Task { @MainActor [weak self] in
+            await self?.refresh()
 
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { break }
-                await self.refresh()
+                await self?.refresh()
             }
         }
     }
@@ -46,7 +46,6 @@ final class TrashMonitor {
         monitoringTask = nil
     }
 
-    @MainActor
     func refresh() async {
         let now = Date()
         if let next = nextAllowedCheckDate, now < next {
@@ -61,7 +60,6 @@ final class TrashMonitor {
         handle(result: countResult)
     }
 
-    @MainActor
     private func handle(result: Result<Int, FinderTrashServiceError>) {
         switch result {
         case .success(let count):
@@ -76,7 +74,6 @@ final class TrashMonitor {
         }
     }
 
-    @MainActor
     private func scheduleBackoff() {
         consecutiveFailures += 1
         let delay: TimeInterval

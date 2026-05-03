@@ -15,6 +15,8 @@ final class DropView: NSView {
         soundPlayer: soundPlayer
     ) { [weak self] in
         await self?.updateTrashStatus()
+    } reportDropFailure: { [weak self] failedCount in
+        self?.showDropFailure(failedCount: failedCount)
     }
     private lazy var trashActionHandler = TrashActionHandler(
         finderTrashService: finderTrashService,
@@ -22,8 +24,8 @@ final class DropView: NSView {
         windowProvider: { [weak self] in
             self?.window
         },
-        logAppleScriptError: { [weak self] error in
-            self?.logAppleScriptError(error)
+        logFinderAppleEventError: { [weak self] error in
+            self?.logFinderAppleEventError(error)
         },
         refreshTrashStatus: { [weak self] in
             await self?.updateTrashStatus()
@@ -58,7 +60,6 @@ final class DropView: NSView {
         wantsLayer = true
         registerForDraggedTypes([.fileURL])
         setupLayers()
-        Task { await updateTrashStatus() }  // 起動直後に一度反映
         startTrashMonitoring()   // 以後はタイマーで更新
     }
 
@@ -72,7 +73,6 @@ final class DropView: NSView {
         wantsLayer = true
         registerForDraggedTypes([.fileURL])
         setupLayers()
-        Task { await updateTrashStatus() }
         startTrashMonitoring()
     }
 
@@ -132,6 +132,10 @@ final class DropView: NSView {
     // MARK: - Drag & Drop Handling
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard dropOperationHandler.canAcceptDrop else {
+            return []
+        }
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         dimLayer.opacity = 1.0
@@ -192,10 +196,28 @@ final class DropView: NSView {
         CATransaction.commit()
     }
 
-    // MARK: - Finder / AppleScript Helpers
+    // MARK: - Finder AppleEvent Helpers
 
-    private func logAppleScriptError(_ error: AppleScriptFailure) {
-        print("AppleScript error [\(error.code)]: \(error.message)")
+    private func logFinderAppleEventError(_ error: FinderAppleEventFailure) {
+        print("Finder AppleEvent error [\(error.code)]: \(error.message)")
+    }
+
+    private func showDropFailure(failedCount: Int) {
+        let message = failedCount == 1
+            ? "1項目をゴミ箱へ移動できませんでした。"
+            : "\(failedCount)項目をゴミ箱へ移動できませんでした。"
+
+        guard let window else {
+            print(message)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "ゴミ箱へ移動できませんでした"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { _ in }
     }
 
     // MARK: - Monitoring

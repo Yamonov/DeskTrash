@@ -1,7 +1,7 @@
 import AudioToolbox
 import Foundation
 
-final class SoundPlayer {
+final class SoundPlayer: Sendable {
     private let dragToTrashSoundID = SoundPlayer.loadSoundID(resource: "Dragtotrash")
     private let emptyTrashSoundID = SoundPlayer.loadSoundID(resource: "Emptytrash")
     private let ejectSoundID = SoundPlayer.loadSoundID(resource: "eject")

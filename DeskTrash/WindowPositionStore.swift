@@ -10,19 +10,49 @@ final class WindowPositionStore {
         self.defaults = defaults
     }
 
-    func restoreOrigin() -> NSPoint {
-        let x = defaults.double(forKey: xKey)
-        let y = defaults.double(forKey: yKey)
-
-        guard x != 0, y != 0 else {
-            return fallbackOrigin
+    func restoreOrigin(windowSize: NSSize) -> NSPoint {
+        guard defaults.object(forKey: xKey) != nil,
+              defaults.object(forKey: yKey) != nil else {
+            return fallbackOrigin(windowSize: windowSize)
         }
 
-        return NSPoint(x: x, y: y)
+        let origin = NSPoint(
+            x: defaults.double(forKey: xKey),
+            y: defaults.double(forKey: yKey)
+        )
+        let frame = NSRect(origin: origin, size: windowSize)
+
+        guard let screen = screen(containing: frame) else {
+            return fallbackOrigin(windowSize: windowSize)
+        }
+
+        return clampedOrigin(origin, windowSize: windowSize, visibleFrame: screen.visibleFrame)
     }
 
     func save(origin: NSPoint) {
         defaults.set(origin.x, forKey: xKey)
         defaults.set(origin.y, forKey: yKey)
+    }
+
+    private func screen(containing frame: NSRect) -> NSScreen? {
+        NSScreen.screens.first { $0.visibleFrame.intersects(frame) }
+    }
+
+    private func fallbackOrigin(windowSize: NSSize) -> NSPoint {
+        guard let visibleFrame = NSScreen.main?.visibleFrame else {
+            return fallbackOrigin
+        }
+
+        return clampedOrigin(fallbackOrigin, windowSize: windowSize, visibleFrame: visibleFrame)
+    }
+
+    private func clampedOrigin(_ origin: NSPoint, windowSize: NSSize, visibleFrame: NSRect) -> NSPoint {
+        let maxX = max(visibleFrame.minX, visibleFrame.maxX - windowSize.width)
+        let maxY = max(visibleFrame.minY, visibleFrame.maxY - windowSize.height)
+
+        return NSPoint(
+            x: min(max(origin.x, visibleFrame.minX), maxX),
+            y: min(max(origin.y, visibleFrame.minY), maxY)
+        )
     }
 }

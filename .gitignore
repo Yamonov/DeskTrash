@@ -5,3 +5,14 @@ build/
 
 *.xcuserstate
 xcuserdata/
+
+# Private app assets
+DeskTrash/Resources/
+DeskTrash/Assets.xcassets/MenuIcon.imageset/
+DeskTrash/Assets.xcassets/AppIcon.appiconset/*.png
+*.caf
+*.aif
+/trashempty2@2x.png
+/trashfull2@2x.png
+/s-trashempty2@2x.png
+/s-trashfull2@2x.png

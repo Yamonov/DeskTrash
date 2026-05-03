@@ -5,20 +5,20 @@ final class TrashActionHandler {
     private let finderTrashService: FinderTrashService
     private let soundPlayer: SoundPlayer
     private let windowProvider: () -> NSWindow?
-    private let logAppleScriptError: (AppleScriptFailure) -> Void
+    private let logFinderAppleEventError: (FinderAppleEventFailure) -> Void
     private let refreshTrashStatus: () async -> Void
 
     init(
         finderTrashService: FinderTrashService,
         soundPlayer: SoundPlayer,
         windowProvider: @escaping () -> NSWindow?,
-        logAppleScriptError: @escaping (AppleScriptFailure) -> Void,
+        logFinderAppleEventError: @escaping (FinderAppleEventFailure) -> Void,
         refreshTrashStatus: @escaping () async -> Void
     ) {
         self.finderTrashService = finderTrashService
         self.soundPlayer = soundPlayer
         self.windowProvider = windowProvider
-        self.logAppleScriptError = logAppleScriptError
+        self.logFinderAppleEventError = logFinderAppleEventError
         self.refreshTrashStatus = refreshTrashStatus
     }
 
@@ -40,7 +40,7 @@ final class TrashActionHandler {
             guard let self else { return }
             if let error = await finderTrashService.openTrash() {
                 await MainActor.run {
-                    self.logAppleScriptError(error)
+                    self.logFinderAppleEventError(error)
                 }
             }
         }
@@ -53,11 +53,11 @@ final class TrashActionHandler {
         alert.messageText = "ゴミ箱を空にしますか？"
         alert.informativeText = "すべてのディスクのゴミ箱の内容が完全に削除されます。"
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "空にする")
         alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "空にする")
 
         let response = await alert.beginSheetModal(for: window)
-        guard response == .alertFirstButtonReturn else {
+        guard response == .alertSecondButtonReturn else {
             return
         }
 
@@ -65,15 +65,31 @@ final class TrashActionHandler {
             guard let self = self else { return }
             let error = await self.finderTrashService.emptyTrash()
 
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                if let error {
-                    self.logAppleScriptError(error)
+            if let error {
+                await self.handleEmptyTrashFailure(error)
+            } else {
+                await MainActor.run { [weak self] in
+                    self?.soundPlayer.playEmptyTrash()
                 }
-                self.soundPlayer.playEmptyTrash()
             }
 
             await self.refreshTrashStatus()
         }
+    }
+
+    private func handleEmptyTrashFailure(_ error: FinderAppleEventFailure) async {
+        logFinderAppleEventError(error)
+
+        guard let window = windowProvider() else {
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "ゴミ箱を空にできませんでした"
+        alert.informativeText = error.message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+
+        _ = await alert.beginSheetModal(for: window)
     }
 }

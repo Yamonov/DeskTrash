@@ -16,7 +16,7 @@ final class DeskTrashWindowController: NSObject, NSWindowDelegate {
     init(positionStore: WindowPositionStore) {
         self.positionStore = positionStore
 
-        let contentRect = NSRect(origin: positionStore.restoreOrigin(), size: windowSize)
+        let contentRect = NSRect(origin: positionStore.restoreOrigin(windowSize: windowSize), size: windowSize)
         let window = KeyableWindow(
             contentRect: contentRect,
             styleMask: [.borderless],
