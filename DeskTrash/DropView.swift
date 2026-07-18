@@ -1,23 +1,44 @@
 import Cocoa
 import ImageIO
+import OSLog
 
 /// ゴミ箱ドロップ領域とバッジ表示を担当するビュー
 @MainActor
 final class DropView: NSView {
+    private static let volumeLogger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "org.iwashi.DeskTrash",
+        category: "VolumeUnmount"
+    )
+
     private let trashService = TrashService()
     private let finderTrashService = FinderTrashService()
     private let soundPlayer = SoundPlayer()
     private lazy var trashMonitor = TrashMonitor(finderTrashService: finderTrashService) { [weak self] count in
         self?.updateTrashIcon(count: count)
     }
+    private lazy var trashOperationCoordinator = TrashOperationCoordinator(
+        suspendTrashMonitoring: { [weak self] in
+            await self?.trashMonitor.suspendAndWait()
+        },
+        resumeTrashMonitoring: { [weak self] in
+            self?.trashMonitor.resume()
+        }
+    )
     private lazy var dropOperationHandler = DropOperationHandler(
         trashService: trashService,
-        soundPlayer: soundPlayer
-    ) { [weak self] in
-        await self?.updateTrashStatus()
-    } reportDropFailure: { [weak self] failedCount in
-        self?.showDropFailure(failedCount: failedCount)
-    }
+        soundPlayer: soundPlayer,
+        refreshTrashStatus: { [weak self] in
+            await self?.updateTrashStatus()
+        },
+        operationCoordinator: trashOperationCoordinator,
+        reportDropFailures: { [weak self] failedCount, lookupFailures, volumeFailures in
+            self?.showDropFailures(
+                failedMoveCount: failedCount,
+                lookupFailures: lookupFailures,
+                volumeUnmountFailures: volumeFailures
+            )
+        }
+    )
     private lazy var trashActionHandler = TrashActionHandler(
         finderTrashService: finderTrashService,
         soundPlayer: soundPlayer,
@@ -27,6 +48,7 @@ final class DropView: NSView {
         logFinderAppleEventError: { [weak self] error in
             self?.logFinderAppleEventError(error)
         },
+        operationCoordinator: trashOperationCoordinator,
         refreshTrashStatus: { [weak self] in
             await self?.updateTrashStatus()
         }
@@ -202,10 +224,41 @@ final class DropView: NSView {
         print("Finder AppleEvent error [\(error.code)]: \(error.message)")
     }
 
-    private func showDropFailure(failedCount: Int) {
-        let message = failedCount == 1
-            ? "1項目をゴミ箱へ移動できませんでした。"
-            : "\(failedCount)項目をゴミ箱へ移動できませんでした。"
+    private func showDropFailures(
+        failedMoveCount: Int,
+        lookupFailures: [ItemLookupFailure],
+        volumeUnmountFailures: [VolumeUnmountFailure]
+    ) {
+        for failure in lookupFailures {
+            logItemLookupFailure(failure)
+        }
+        for failure in volumeUnmountFailures {
+            logVolumeUnmountFailure(failure)
+        }
+
+        let messageText: String
+        let hasVolumeFailures = !lookupFailures.isEmpty || !volumeUnmountFailures.isEmpty
+        if failedMoveCount > 0 && hasVolumeFailures {
+            messageText = "一部の項目を処理できませんでした"
+        } else if !lookupFailures.isEmpty {
+            messageText = "項目を確認できませんでした"
+        } else if !volumeUnmountFailures.isEmpty {
+            messageText = "ボリュームをアンマウントできませんでした"
+        } else {
+            messageText = "ゴミ箱へ移動できませんでした"
+        }
+
+        var details: [String] = []
+        if failedMoveCount > 0 {
+            let fileMessage = failedMoveCount == 1
+                ? "1項目をゴミ箱へ移動できませんでした。"
+                : "\(failedMoveCount)項目をゴミ箱へ移動できませんでした。"
+            details.append(fileMessage)
+        }
+
+        details.append(contentsOf: lookupFailures.map(itemLookupFailureDescription))
+        details.append(contentsOf: volumeUnmountFailures.map(volumeUnmountFailureDescription))
+        let message = details.joined(separator: "\n\n")
 
         guard let window else {
             print(message)
@@ -213,11 +266,61 @@ final class DropView: NSView {
         }
 
         let alert = NSAlert()
-        alert.messageText = "ゴミ箱へ移動できませんでした"
+        alert.messageText = messageText
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
         alert.beginSheetModal(for: window) { _ in }
+    }
+
+    private func volumeUnmountFailureDescription(_ failure: VolumeUnmountFailure) -> String {
+        var lines = ["「\(volumeName(for: failure.volumeURL))」", failure.message]
+        if let processIdentifier = failure.dissentingProcessIdentifier {
+            lines.append("使用中のアプリケーション: \(processDescription(processIdentifier: processIdentifier))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func itemLookupFailureDescription(_ failure: ItemLookupFailure) -> String {
+        [
+            "「\(volumeName(for: failure.url))」",
+            "項目がファイルかボリュームか確認できませんでした。",
+            failure.message,
+        ].joined(separator: "\n")
+    }
+
+    private func logItemLookupFailure(_ failure: ItemLookupFailure) {
+        let name = volumeName(for: failure.url)
+        Self.volumeLogger.error(
+            "Item lookup failed: domain=\(failure.domain, privacy: .public), code=\(failure.code), item=\(name, privacy: .private), message=\(failure.message, privacy: .private)"
+        )
+    }
+
+    private func logVolumeUnmountFailure(_ failure: VolumeUnmountFailure) {
+        let name = volumeName(for: failure.volumeURL)
+        if let processIdentifier = failure.dissentingProcessIdentifier {
+            let process = processDescription(processIdentifier: processIdentifier)
+            Self.volumeLogger.error(
+                "Volume unmount failed: domain=\(failure.domain, privacy: .public), code=\(failure.code), volume=\(name, privacy: .private), message=\(failure.message, privacy: .private), dissentingProcess=\(process, privacy: .private), pid=\(processIdentifier)"
+            )
+        } else {
+            Self.volumeLogger.error(
+                "Volume unmount failed: domain=\(failure.domain, privacy: .public), code=\(failure.code), volume=\(name, privacy: .private), message=\(failure.message, privacy: .private)"
+            )
+        }
+    }
+
+    private func volumeName(for url: URL) -> String {
+        let name = url.lastPathComponent
+        return name.isEmpty ? url.path : name
+    }
+
+    private func processDescription(processIdentifier: Int32) -> String {
+        if let application = NSRunningApplication(processIdentifier: processIdentifier),
+           let applicationName = application.localizedName {
+            return "\(applicationName) (PID \(processIdentifier))"
+        }
+        return "PID \(processIdentifier)"
     }
 
     // MARK: - Monitoring

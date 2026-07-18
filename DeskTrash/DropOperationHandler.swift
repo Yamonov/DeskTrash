@@ -1,11 +1,39 @@
 import Cocoa
 
+struct VolumeUnmountBatchResult: Sendable {
+    let results: [VolumeUnmountResult]
+    let lookupFailures: [ItemLookupFailure]
+
+    var didEjectVolume: Bool {
+        results.contains { result in
+            if case .success = result {
+                return true
+            }
+            return false
+        }
+    }
+
+    var unmountFailures: [VolumeUnmountFailure] {
+        results.compactMap { result in
+            guard case .failure(let failure) = result else {
+                return nil
+            }
+            return failure
+        }
+    }
+}
+
 @MainActor
 final class DropOperationHandler {
     private let trashService: TrashService
     private let soundPlayer: SoundPlayer
     private let refreshTrashStatus: @MainActor @Sendable () async -> Void
-    private let reportDropFailure: @MainActor @Sendable (Int) -> Void
+    private let operationCoordinator: TrashOperationCoordinator
+    private let reportDropFailures: @MainActor @Sendable (
+        Int,
+        [ItemLookupFailure],
+        [VolumeUnmountFailure]
+    ) -> Void
     private var isProcessingDrop = false
     private var dropTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
@@ -18,12 +46,18 @@ final class DropOperationHandler {
         trashService: TrashService,
         soundPlayer: SoundPlayer,
         refreshTrashStatus: @escaping @MainActor @Sendable () async -> Void,
-        reportDropFailure: @escaping @MainActor @Sendable (Int) -> Void
+        operationCoordinator: TrashOperationCoordinator,
+        reportDropFailures: @escaping @MainActor @Sendable (
+            Int,
+            [ItemLookupFailure],
+            [VolumeUnmountFailure]
+        ) -> Void
     ) {
         self.trashService = trashService
         self.soundPlayer = soundPlayer
         self.refreshTrashStatus = refreshTrashStatus
-        self.reportDropFailure = reportDropFailure
+        self.operationCoordinator = operationCoordinator
+        self.reportDropFailures = reportDropFailures
     }
 
     deinit {
@@ -53,7 +87,7 @@ final class DropOperationHandler {
 
             guard !Task.isCancelled else { return }
 
-            let result = await Self.processDrop(items, trashService: self.trashService)
+            guard let result = await self.processDrop(items) else { return }
             guard !Task.isCancelled else { return }
 
             await self.handleDropResult(result)
@@ -61,87 +95,163 @@ final class DropOperationHandler {
         return true
     }
 
-    private nonisolated struct DropOperationResult: Sendable {
+    private nonisolated struct ClassifiedItems: Sendable {
+        let fileURLs: [URL]
+        let volumeTargets: [VolumeTarget]
+        let lookupFailures: [ItemLookupFailure]
+    }
+
+    private nonisolated struct FileMoveResult: Sendable {
+        let didMoveFile: Bool
+        let failedCount: Int
+    }
+
+    nonisolated struct DropOperationResult: Sendable {
         let didMoveFile: Bool
         let failedMoveCount: Int
-        let didEjectVolume: Bool
-        let shouldRefreshTrashStatus: Bool
+        let volumeBatchResult: VolumeUnmountBatchResult
+
+        var didEjectVolume: Bool {
+            volumeBatchResult.didEjectVolume
+        }
+
+        var volumeUnmountFailures: [VolumeUnmountFailure] {
+            volumeBatchResult.unmountFailures
+        }
+
+        var shouldRefreshTrashStatus: Bool {
+            didMoveFile || didEjectVolume
+        }
     }
 
-    private nonisolated static func processDrop(_ items: [URL], trashService: TrashService) async -> DropOperationResult {
-        await Task.detached(priority: .userInitiated) {
-            let classifiedItems = classify(items, trashService: trashService)
-            let moveResult = moveFilesToTrash(classifiedItems.fileURLs, trashService: trashService)
-            let didEjectVolume = ejectVolumes(classifiedItems.volumeURLs, trashService: trashService)
-            let shouldRefreshTrashStatus = moveResult.didMoveFile || didEjectVolume
+    func processDrop(_ items: [URL]) async -> DropOperationResult? {
+        let classifiedItems = await Self.classify(items, trashService: trashService)
+        guard !Task.isCancelled else { return nil }
 
-            return DropOperationResult(
-                didMoveFile: moveResult.didMoveFile,
-                failedMoveCount: moveResult.failedCount,
-                didEjectVolume: didEjectVolume,
-                shouldRefreshTrashStatus: shouldRefreshTrashStatus
+        let moveResult = await Self.moveFilesToTrash(classifiedItems.fileURLs, trashService: trashService)
+        guard !Task.isCancelled else { return nil }
+
+        var volumeBatchResult = VolumeUnmountBatchResult(
+            results: [],
+            lookupFailures: classifiedItems.lookupFailures
+        )
+        if !classifiedItems.volumeTargets.isEmpty {
+            do {
+                let unmountResult = try await operationCoordinator.withExclusiveOperation {
+                    await Self.ejectVolumes(
+                        classifiedItems.volumeTargets,
+                        trashService: self.trashService
+                    )
+                }
+                volumeBatchResult = VolumeUnmountBatchResult(
+                    results: unmountResult.results,
+                    lookupFailures: classifiedItems.lookupFailures + unmountResult.lookupFailures
+                )
+            } catch is CancellationError {
+                return nil
+            } catch {
+                return nil
+            }
+        }
+
+        return DropOperationResult(
+            didMoveFile: moveResult.didMoveFile,
+            failedMoveCount: moveResult.failedCount,
+            volumeBatchResult: volumeBatchResult
+        )
+    }
+
+    private nonisolated static func classify(_ items: [URL], trashService: TrashService) async -> ClassifiedItems {
+        let task = Task.detached(priority: .userInitiated) {
+            var fileURLs: [URL] = []
+            var volumeTargets: [VolumeTarget] = []
+            var lookupFailures: [ItemLookupFailure] = []
+            var seenMountPaths: Set<String> = []
+
+            for url in items {
+                guard !Task.isCancelled else { break }
+                switch trashService.classifyItem(at: url) {
+                case .file(let fileURL):
+                    fileURLs.append(fileURL)
+                case .volume(let target):
+                    if seenMountPaths.insert(target.canonicalMountPath).inserted {
+                        volumeTargets.append(target)
+                    }
+                case .lookupFailed(let failure):
+                    lookupFailures.append(failure)
+                }
+            }
+
+            return ClassifiedItems(
+                fileURLs: fileURLs,
+                volumeTargets: volumeTargets,
+                lookupFailures: lookupFailures
             )
-        }.value
-    }
-
-    private nonisolated static func classify(_ items: [URL], trashService: TrashService) -> (fileURLs: [URL], volumeURLs: [URL]) {
-        var fileURLs: [URL] = []
-        var volumeURLs: [URL] = []
-        let volumeRoots = trashService.mountedVolumeRoots()
-
-        for url in items {
-            if trashService.isVolumeRoot(url: url, mountedVolumeRoots: volumeRoots) {
-                volumeURLs.append(url)
-            } else {
-                fileURLs.append(url)
-            }
         }
 
-        return (fileURLs, volumeURLs)
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
-    private nonisolated static func moveFilesToTrash(_ fileURLs: [URL], trashService: TrashService) -> (didMoveFile: Bool, failedCount: Int) {
+    private nonisolated static func moveFilesToTrash(_ fileURLs: [URL], trashService: TrashService) async -> FileMoveResult {
         guard !fileURLs.isEmpty else {
-            return (false, 0)
+            return FileMoveResult(didMoveFile: false, failedCount: 0)
         }
 
-        var didMoveFile = false
-        var failedCount = 0
+        let task = Task.detached(priority: .userInitiated) {
+            var didMoveFile = false
+            var failedCount = 0
 
-        for url in fileURLs {
-            let didMove = autoreleasepool {
-                trashService.moveToTrash(url: url)
+            for url in fileURLs {
+                guard !Task.isCancelled else { break }
+                let didMove = autoreleasepool {
+                    trashService.moveToTrash(url: url)
+                }
+
+                if didMove {
+                    didMoveFile = true
+                } else {
+                    failedCount += 1
+                }
             }
 
-            if didMove {
-                didMoveFile = true
-            } else {
-                failedCount += 1
-            }
+            return FileMoveResult(didMoveFile: didMoveFile, failedCount: failedCount)
         }
 
-        return (didMoveFile, failedCount)
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
-    private nonisolated static func ejectVolumes(_ volumeURLs: [URL], trashService: TrashService) -> Bool {
-        guard !volumeURLs.isEmpty else {
-            return false
-        }
+    private nonisolated static func ejectVolumes(
+        _ volumeTargets: [VolumeTarget],
+        trashService: TrashService
+    ) async -> VolumeUnmountBatchResult {
+        var results: [VolumeUnmountResult] = []
+        var lookupFailures: [ItemLookupFailure] = []
+        results.reserveCapacity(volumeTargets.count)
 
-        var didEjectVolume = false
-        for url in volumeURLs {
-            if trashService.eject(volumeURL: url) {
-                didEjectVolume = true
+        for volume in volumeTargets {
+            guard !Task.isCancelled else { break }
+
+            let result = await trashService.eject(volume: volume)
+            if case .lookupFailed(let failure) = result {
+                lookupFailures.append(failure)
+            } else {
+                results.append(result)
             }
         }
 
-        return didEjectVolume
+        return VolumeUnmountBatchResult(results: results, lookupFailures: lookupFailures)
     }
 
     private func handleDropResult(_ result: DropOperationResult) async {
-        if result.failedMoveCount > 0 {
-            reportDropFailure(result.failedMoveCount)
-        }
+        reportFailures(for: result)
 
         if result.didMoveFile {
             soundPlayer.playDragToTrash()
@@ -158,6 +268,15 @@ final class DropOperationHandler {
         if result.shouldRefreshTrashStatus {
             scheduleTrashRefresh()
         }
+    }
+
+    func reportFailures(for result: DropOperationResult) {
+        let lookupFailures = result.volumeBatchResult.lookupFailures
+        let volumeFailures = result.volumeUnmountFailures
+        guard result.failedMoveCount > 0 || !lookupFailures.isEmpty || !volumeFailures.isEmpty else {
+            return
+        }
+        reportDropFailures(result.failedMoveCount, lookupFailures, volumeFailures)
     }
 
     private func scheduleTrashRefresh() {

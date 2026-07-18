@@ -6,6 +6,7 @@ final class TrashActionHandler {
     private let soundPlayer: SoundPlayer
     private let windowProvider: () -> NSWindow?
     private let logFinderAppleEventError: (FinderAppleEventFailure) -> Void
+    private let operationCoordinator: TrashOperationCoordinator
     private let refreshTrashStatus: () async -> Void
 
     init(
@@ -13,12 +14,14 @@ final class TrashActionHandler {
         soundPlayer: SoundPlayer,
         windowProvider: @escaping () -> NSWindow?,
         logFinderAppleEventError: @escaping (FinderAppleEventFailure) -> Void,
+        operationCoordinator: TrashOperationCoordinator,
         refreshTrashStatus: @escaping () async -> Void
     ) {
         self.finderTrashService = finderTrashService
         self.soundPlayer = soundPlayer
         self.windowProvider = windowProvider
         self.logFinderAppleEventError = logFinderAppleEventError
+        self.operationCoordinator = operationCoordinator
         self.refreshTrashStatus = refreshTrashStatus
     }
 
@@ -36,12 +39,19 @@ final class TrashActionHandler {
     }
 
     func openTrashFolder() {
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
-            if let error = await finderTrashService.openTrash() {
-                await MainActor.run {
+            do {
+                let error = try await operationCoordinator.withExclusiveOperation {
+                    await self.finderTrashService.openTrash()
+                }
+                if let error {
                     self.logFinderAppleEventError(error)
                 }
+            } catch is CancellationError {
+                return
+            } catch {
+                return
             }
         }
     }
@@ -61,20 +71,24 @@ final class TrashActionHandler {
             return
         }
 
-        Task(priority: .userInitiated) { [weak self] in
-            guard let self = self else { return }
-            let error = await self.finderTrashService.emptyTrash()
-
-            if let error {
-                await self.handleEmptyTrashFailure(error)
-            } else {
-                await MainActor.run { [weak self] in
-                    self?.soundPlayer.playEmptyTrash()
-                }
+        let error: FinderAppleEventFailure?
+        do {
+            error = try await operationCoordinator.withExclusiveOperation {
+                await self.finderTrashService.emptyTrash()
             }
-
-            await self.refreshTrashStatus()
+        } catch is CancellationError {
+            return
+        } catch {
+            return
         }
+
+        if let error {
+            await handleEmptyTrashFailure(error)
+        } else {
+            soundPlayer.playEmptyTrash()
+        }
+
+        await refreshTrashStatus()
     }
 
     private func handleEmptyTrashFailure(_ error: FinderAppleEventFailure) async {
